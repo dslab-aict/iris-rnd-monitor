@@ -209,7 +209,7 @@ def parse_detail_fields(html: str) -> dict[str, str]:
 
 
 def normalize_iris_detail_link(raw: str, base_url: str = BASE_URL) -> str:
-    """Return a canonical IRIS detail URL when ancmId/ancmPrg are available."""
+    """Return canonical IRIS detail URL only when non-empty ancmId exists."""
     raw = clean_text(raw)
     if not raw:
         return ""
@@ -217,55 +217,74 @@ def normalize_iris_detail_link(raw: str, base_url: str = BASE_URL) -> str:
         raw = "https:" + raw
     absolute = urljoin("https://www.iris.go.kr", raw)
     parsed = urlparse(absolute)
-    qs = parse_qs(parsed.query)
-    ancm_id = (qs.get("ancmId") or qs.get("ancm_id") or [""])[0]
-    ancm_prg = (qs.get("ancmPrg") or qs.get("ancm_prg") or [""])[0]
-    if ancm_id:
-        params = {"ancmId": ancm_id}
-        if ancm_prg:
-            params["ancmPrg"] = ancm_prg
-        return "https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?" + urlencode(params)
-    return absolute if "retrieveBsnsAncmView.do" in absolute and "?" in absolute else ""
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    ancm_id = clean_text((qs.get("ancmId") or qs.get("ancm_id") or [""])[0])
+    ancm_prg = clean_text((qs.get("ancmPrg") or qs.get("ancm_prg") or [""])[0])
+    if not re.fullmatch(r"\d{3,}", ancm_id):
+        return ""
+    return "https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?" + urlencode({"ancmId": ancm_id, "ancmPrg": ancm_prg or "ancmIng"})
 
 
-def extract_detail_link_from_html(html: str, current_url: str = "") -> str:
-    """Extract the shareable detail link from IRIS detail HTML/scripts."""
-    haystacks = [current_url or "", html or ""]
+def extract_iris_ancm_params(text: str) -> tuple[str, str]:
+    text = text or ""
     url_pat = r"(?:https?://www\.iris\.go\.kr)?/contents/retrieveBsnsAncmView\.do\?[^\s'\"<>]+"
-    for text in haystacks:
-        for m in re.finditer(url_pat, text):
-            link = normalize_iris_detail_link(m.group(0))
-            if link:
-                return link
-
-    combined = "\n".join(haystacks)
+    for m in re.finditer(url_pat, text):
+        parsed = urlparse(urljoin("https://www.iris.go.kr", m.group(0)))
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        ancm_id = clean_text((qs.get("ancmId") or qs.get("ancm_id") or [""])[0])
+        ancm_prg = clean_text((qs.get("ancmPrg") or qs.get("ancm_prg") or [""])[0])
+        if re.fullmatch(r"\d{3,}", ancm_id):
+            return ancm_id, ancm_prg or "ancmIng"
     id_patterns = [
+        r"name\s*=\s*['\"]ancmId['\"][^>]{0,300}?value\s*=\s*['\"]?(\d{3,})",
+        r"value\s*=\s*['\"]?(\d{3,})['\"]?[^>]{0,300}?name\s*=\s*['\"]ancmId['\"]",
+        r"id\s*=\s*['\"]ancmId['\"][^>]{0,300}?value\s*=\s*['\"]?(\d{3,})",
+        r"value\s*=\s*['\"]?(\d{3,})['\"]?[^>]{0,300}?id\s*=\s*['\"]ancmId['\"]",
         r"ancmId\s*[:=]\s*['\"]?(\d{3,})",
-        r"name\s*=\s*['\"]ancmId['\"][^>]*value\s*=\s*['\"]?(\d{3,})",
-        r"id\s*=\s*['\"]ancmId['\"][^>]*value\s*=\s*['\"]?(\d{3,})",
-        r"['\"]ancmId['\"]\s*,\s*['\"]?(\d{3,})",
+        r"ancm_id\s*[:=]\s*['\"]?(\d{3,})",
+        r"['\"]ancmId['\"]\s*[,=:]\s*['\"]?(\d{3,})",
     ]
     prg_patterns = [
+        r"name\s*=\s*['\"]ancmPrg['\"][^>]{0,300}?value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"value\s*=\s*['\"]?([A-Za-z0-9_\-]+)['\"]?[^>]{0,300}?name\s*=\s*['\"]ancmPrg['\"]",
+        r"id\s*=\s*['\"]ancmPrg['\"][^>]{0,300}?value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"value\s*=\s*['\"]?([A-Za-z0-9_\-]+)['\"]?[^>]{0,300}?id\s*=\s*['\"]ancmPrg['\"]",
         r"ancmPrg\s*[:=]\s*['\"]?([A-Za-z0-9_\-]+)",
-        r"name\s*=\s*['\"]ancmPrg['\"][^>]*value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
-        r"id\s*=\s*['\"]ancmPrg['\"][^>]*value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
-        r"['\"]ancmPrg['\"]\s*,\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"ancm_prg\s*[:=]\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"['\"]ancmPrg['\"]\s*[,=:]\s*['\"]?([A-Za-z0-9_\-]+)",
     ]
     ancm_id = ""
     ancm_prg = ""
     for pat in id_patterns:
-        m = re.search(pat, combined, flags=re.I)
+        m = re.search(pat, text, flags=re.I | re.S)
         if m:
-            ancm_id = m.group(1)
+            ancm_id = clean_text(m.group(1))
             break
     for pat in prg_patterns:
-        m = re.search(pat, combined, flags=re.I)
+        m = re.search(pat, text, flags=re.I | re.S)
         if m:
-            ancm_prg = m.group(1)
+            ancm_prg = clean_text(m.group(1))
             break
-    if ancm_id:
-        return normalize_iris_detail_link("/contents/retrieveBsnsAncmView.do?" + urlencode({"ancmId": ancm_id, "ancmPrg": ancm_prg or "ancmIng"}))
-    return normalize_iris_detail_link(current_url or "")
+    if re.fullmatch(r"\d{3,}", ancm_id):
+        return ancm_id, ancm_prg or "ancmIng"
+    for m in re.finditer(r"\(([^()]{0,500})\)", text):
+        args = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+        id_arg = next((a for a in args if re.fullmatch(r"\d{3,}", a)), "")
+        prg_arg = next((a for a in args if re.fullmatch(r"ancm[A-Za-z0-9_\-]*", a)), "")
+        if id_arg:
+            return id_arg, prg_arg or "ancmIng"
+    return "", ""
+
+
+def build_iris_detail_link_from_text(text: str) -> str:
+    ancm_id, ancm_prg = extract_iris_ancm_params(text)
+    if not ancm_id:
+        return ""
+    return normalize_iris_detail_link("/contents/retrieveBsnsAncmView.do?" + urlencode({"ancmId": ancm_id, "ancmPrg": ancm_prg or "ancmIng"}))
+
+
+def extract_detail_link_from_html(html: str, current_url: str = "") -> str:
+    return build_iris_detail_link_from_text("\n".join([current_url or "", html or ""]))
 
 
 def fetch_html(url: str, timeout: int = 30) -> str:
@@ -369,7 +388,9 @@ def click_title_js() -> str:
       const clickable = best.closest('a, button, [onclick], li[onclick], div[onclick]') || best;
       clickable.scrollIntoView({block:'center', inline:'center'});
       clickable.click();
-      return {clicked:true, tag: clickable.tagName, text: norm(clickable.innerText || clickable.textContent || '').slice(0, 200)};
+      const parent = clickable.closest('li, tr, div') || clickable.parentElement;
+      const collect = (el) => el ? {tag: el.tagName, text: norm(el.innerText || el.textContent || '').slice(0,300), href: el.href || el.getAttribute('href') || '', onclick: el.getAttribute('onclick') || '', outerHTML: (el.outerHTML || '').slice(0,2500), dataset: Object.assign({}, el.dataset || {})} : {};
+      return {clicked:true, metadata:{best:collect(best), clickable:collect(clickable), parent:collect(parent), forms:Array.from(document.querySelectorAll('input[type=hidden], input[name*=ancm], input[id*=ancm]')).map(collect).slice(0,80)}};
     }
     '''
 
@@ -417,12 +438,7 @@ def click_link_share_js() -> str:
 
 
 def find_url_in_text(text: str) -> str:
-    text = text or ""
-    for m in re.finditer(r"https?://www\.iris\.go\.kr/contents/retrieveBsnsAncmView\.do\?[^\s'\"<>]+", text):
-        link = normalize_iris_detail_link(m.group(0))
-        if link:
-            return link
-    return ""
+    return build_iris_detail_link_from_text(text or "")
 
 
 def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = True) -> list[Announcement]:
@@ -477,7 +493,9 @@ def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = Tru
 
                 before_url = page.url
                 click_result = page.evaluate(click_title_js(), record.title)
-                print(f"[info] detail click page={page_no} item={idx} clicked={click_result.get('clicked')} title={record.title[:60]}")
+                click_json = json.dumps(click_result, ensure_ascii=False)
+                pre_click_link = build_iris_detail_link_from_text(click_json)
+                print(f"[info] detail click page={page_no} item={idx} clicked={click_result.get('clicked')} pre_link={pre_click_link or '-'} title={record.title[:60]}")
                 if not click_result.get("clicked"):
                     detailed.append(record)
                     continue
@@ -490,7 +508,7 @@ def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = Tru
                 detail_url = page.url
                 # If content did not change meaningfully, still save debug and keep list fields.
                 (debug_dir / f"debug_iris_detail_p{page_no}_i{idx}.html").write_text(detail_html, encoding="utf-8")
-                share_link = extract_detail_link_from_html(detail_html, detail_url)
+                share_link = pre_click_link or extract_detail_link_from_html(detail_html, detail_url)
                 if not share_link:
                     try:
                         share_result = page.evaluate(click_link_share_js())
@@ -502,9 +520,11 @@ def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = Tru
                         share_link = find_url_in_text(share_text) or extract_detail_link_from_html(share_html, detail_url)
                     except Exception as exc:
                         print(f"[warn] link share extraction failed page={page_no} item={idx}: {exc}")
-                final_link = share_link or detail_url
+                final_link = share_link
+                if not final_link:
+                    print(f"[warn] no valid ancmId found page={page_no} item={idx}; leaving link blank instead of writing malformed URL")
                 if detail_url == before_url and record.title in "\n".join(html_to_lines(detail_html)) and len(parse_list_records(detail_html, detail_url)) >= len(list_records):
-                    detailed.append(replace(record, link=final_link or record.link))
+                    detailed.append(replace(record, link=final_link))
                 else:
                     detailed.append(merge_records(record, detail_html, final_link))
 
