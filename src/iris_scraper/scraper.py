@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin, urlencode
+from urllib.parse import parse_qs, urljoin, urlencode, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -207,6 +207,67 @@ def parse_detail_fields(html: str) -> dict[str, str]:
     return {"period": period, "contact": contact, "summary": summary}
 
 
+
+def normalize_iris_detail_link(raw: str, base_url: str = BASE_URL) -> str:
+    """Return a canonical IRIS detail URL when ancmId/ancmPrg are available."""
+    raw = clean_text(raw)
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    absolute = urljoin("https://www.iris.go.kr", raw)
+    parsed = urlparse(absolute)
+    qs = parse_qs(parsed.query)
+    ancm_id = (qs.get("ancmId") or qs.get("ancm_id") or [""])[0]
+    ancm_prg = (qs.get("ancmPrg") or qs.get("ancm_prg") or [""])[0]
+    if ancm_id:
+        params = {"ancmId": ancm_id}
+        if ancm_prg:
+            params["ancmPrg"] = ancm_prg
+        return "https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?" + urlencode(params)
+    return absolute if "retrieveBsnsAncmView.do" in absolute and "?" in absolute else ""
+
+
+def extract_detail_link_from_html(html: str, current_url: str = "") -> str:
+    """Extract the shareable detail link from IRIS detail HTML/scripts."""
+    haystacks = [current_url or "", html or ""]
+    url_pat = r"(?:https?://www\.iris\.go\.kr)?/contents/retrieveBsnsAncmView\.do\?[^\s'\"<>]+"
+    for text in haystacks:
+        for m in re.finditer(url_pat, text):
+            link = normalize_iris_detail_link(m.group(0))
+            if link:
+                return link
+
+    combined = "\n".join(haystacks)
+    id_patterns = [
+        r"ancmId\s*[:=]\s*['\"]?(\d{3,})",
+        r"name\s*=\s*['\"]ancmId['\"][^>]*value\s*=\s*['\"]?(\d{3,})",
+        r"id\s*=\s*['\"]ancmId['\"][^>]*value\s*=\s*['\"]?(\d{3,})",
+        r"['\"]ancmId['\"]\s*,\s*['\"]?(\d{3,})",
+    ]
+    prg_patterns = [
+        r"ancmPrg\s*[:=]\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"name\s*=\s*['\"]ancmPrg['\"][^>]*value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"id\s*=\s*['\"]ancmPrg['\"][^>]*value\s*=\s*['\"]?([A-Za-z0-9_\-]+)",
+        r"['\"]ancmPrg['\"]\s*,\s*['\"]?([A-Za-z0-9_\-]+)",
+    ]
+    ancm_id = ""
+    ancm_prg = ""
+    for pat in id_patterns:
+        m = re.search(pat, combined, flags=re.I)
+        if m:
+            ancm_id = m.group(1)
+            break
+    for pat in prg_patterns:
+        m = re.search(pat, combined, flags=re.I)
+        if m:
+            ancm_prg = m.group(1)
+            break
+    if ancm_id:
+        return normalize_iris_detail_link("/contents/retrieveBsnsAncmView.do?" + urlencode({"ancmId": ancm_id, "ancmPrg": ancm_prg or "ancmIng"}))
+    return normalize_iris_detail_link(current_url or "")
+
+
 def fetch_html(url: str, timeout: int = 30) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
@@ -333,6 +394,37 @@ def click_page_js() -> str:
     '''
 
 
+
+def click_link_share_js() -> str:
+    return r"""
+    () => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const nodes = Array.from(document.querySelectorAll('a, button, [onclick], span, div, input'));
+      let target = null;
+      for (const node of nodes) {
+        const text = norm(node.innerText || node.textContent || node.value || node.getAttribute('title') || node.getAttribute('aria-label') || '');
+        if (text.includes('링크공유') || text.includes('링크 공유') || text.includes('URL복사') || text.includes('URL 복사')) {
+          target = node.closest('a, button, [onclick]') || node;
+          break;
+        }
+      }
+      if (!target) return {clicked:false, reason:'share_button_not_found'};
+      target.scrollIntoView({block:'center', inline:'center'});
+      target.click();
+      return {clicked:true, text:norm(target.innerText || target.textContent || target.value || '').slice(0, 100)};
+    }
+    """
+
+
+def find_url_in_text(text: str) -> str:
+    text = text or ""
+    for m in re.finditer(r"https?://www\.iris\.go\.kr/contents/retrieveBsnsAncmView\.do\?[^\s'\"<>]+", text):
+        link = normalize_iris_detail_link(m.group(0))
+        if link:
+            return link
+    return ""
+
+
 def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = True) -> list[Announcement]:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -398,10 +490,23 @@ def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = Tru
                 detail_url = page.url
                 # If content did not change meaningfully, still save debug and keep list fields.
                 (debug_dir / f"debug_iris_detail_p{page_no}_i{idx}.html").write_text(detail_html, encoding="utf-8")
+                share_link = extract_detail_link_from_html(detail_html, detail_url)
+                if not share_link:
+                    try:
+                        share_result = page.evaluate(click_link_share_js())
+                        print(f"[info] link share page={page_no} item={idx} result={json.dumps(share_result, ensure_ascii=False)}")
+                        time.sleep(0.4)
+                        share_html = page.content()
+                        share_text = page.locator("body").inner_text(timeout=3000)
+                        (debug_dir / f"debug_iris_share_p{page_no}_i{idx}.html").write_text(share_html, encoding="utf-8")
+                        share_link = find_url_in_text(share_text) or extract_detail_link_from_html(share_html, detail_url)
+                    except Exception as exc:
+                        print(f"[warn] link share extraction failed page={page_no} item={idx}: {exc}")
+                final_link = share_link or detail_url
                 if detail_url == before_url and record.title in "\n".join(html_to_lines(detail_html)) and len(parse_list_records(detail_html, detail_url)) >= len(list_records):
-                    detailed.append(record)
+                    detailed.append(replace(record, link=final_link or record.link))
                 else:
-                    detailed.append(merge_records(record, detail_html, detail_url))
+                    detailed.append(merge_records(record, detail_html, final_link))
 
         context.close()
         browser.close()

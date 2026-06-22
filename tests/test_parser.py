@@ -37,3 +37,26 @@ def test_parse_detail_fields():
     assert "2026.06.22" in fields["period"]
     assert "042-123-4567" in fields["contact"]
     assert "test@example.kr" in fields["contact"]
+
+from iris_scraper.scraper import extract_detail_link_from_html, normalize_iris_detail_link
+
+
+def test_normalize_share_link():
+    link = normalize_iris_detail_link('/contents/retrieveBsnsAncmView.do?ancmId=022515&ancmPrg=ancmIng')
+    assert link == 'https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?ancmId=022515&ancmPrg=ancmIng'
+
+
+def test_extract_detail_link_from_html_script_values():
+    html = """
+    <input type="hidden" name="ancmId" value="022515">
+    <input type="hidden" name="ancmPrg" value="ancmIng">
+    <button>링크공유</button>
+    """
+    assert extract_detail_link_from_html(html) == 'https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?ancmId=022515&ancmPrg=ancmIng'
+
+
+def test_extract_detail_link_from_share_popup_text():
+    html = """
+    <div>https://www.iris.go.kr/contents/retrieveBsnsAncmView.do?ancmId=022515&ancmPrg=ancmIng</div>
+    """
+    assert extract_detail_link_from_html(html).endswith('ancmId=022515&ancmPrg=ancmIng')
