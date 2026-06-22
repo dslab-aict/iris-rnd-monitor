@@ -176,54 +176,55 @@ def parse_detail_fields(html: str) -> tuple[str, str]:
     return period, contact
 
 
-def parse_announcements_from_html(html: str, page_url: str = BASE_URL, fetch_details: bool = False) -> list[Announcement]:
+
+def extract_announcements_by_regex(html: str, page_url: str = BASE_URL) -> list[Announcement]:
+    """Parse the IRIS public list from text, without relying on fragile CSS selectors.
+
+    IRIS currently renders list records in this textual sequence:
+    소관부처 > 전문기관 / 공고명 / 공고번호 : ... 공고일자 : ... 공고상태 : ... 공모유형 : ...
+    The exact DOM classes are not stable, so this function treats the page as text.
+    """
     lines = html_to_lines(html)
+    text = "\n".join(lines)
     collected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     records: list[Announcement] = []
 
-    for i, line in enumerate(lines):
-        if " > " not in line:
+    # Main pattern: each record begins with a ministry/agency line and ends at 공모유형.
+    pattern = re.compile(
+        r"(?P<ministry>[^\n<>]{2,60}?)\s*>\s*(?P<agency>[^\n<>]{2,90}?)\n+"
+        r"(?P<title>(?:(?!\n\s*공고번호\s*:).)+?)\n+"
+        r"공고번호\s*:\s*(?P<notice_no>.*?)\s*공고일자\s*:\s*"
+        r"(?P<notice_date>\d{4}-\d{2}-\d{2})\s*공고상태\s*:\s*"
+        r"(?P<status>.*?)\s*공모유형\s*:\s*(?P<competition_type>[^\n]+)",
+        re.DOTALL,
+    )
+
+    bad_prefixes = (
+        "관련부처", "전문기관 홈페이지", "IRIS", "Home", "사업정보", "R&D정보",
+        "소관부처 전체선택", "전문기관 전체선택",
+    )
+
+    for m in pattern.finditer(text):
+        ministry = clean_text(m.group("ministry"))
+        agency = clean_text(m.group("agency"))
+        title = clean_text(m.group("title"))
+        notice_no = clean_text(m.group("notice_no"))
+        notice_date = clean_text(m.group("notice_date"))
+        status = clean_text(m.group("status"))
+        competition_type = clean_text(m.group("competition_type"))
+
+        if any(ministry.startswith(x) for x in bad_prefixes):
             continue
-        if any(x in line for x in ["관련부처", "전문기관 홈페이지", "IRIS", "Home"]):
+        if "전체선택" in ministry or "전체선택" in agency:
             continue
-        if len(line) > 140:
+        if not notice_no or not title or not notice_date:
+            continue
+        # Avoid footer link blocks and navigation noise.
+        if len(ministry) > 60 or len(agency) > 90 or len(title) > 260:
             continue
 
-        ministry, agency = [clean_text(x) for x in line.split(" > ", 1)]
-        if not ministry or not agency:
-            continue
-
-        title = ""
-        meta = ""
-        explicit_status = ""
-        for j in range(i + 1, min(i + 12, len(lines))):
-            candidate = lines[j]
-            if candidate in STATUS_WORDS and not explicit_status:
-                explicit_status = candidate
-                continue
-            if "공고번호" in candidate and "공고일자" in candidate:
-                meta = candidate
-                break
-            if not title and "공고번호" not in candidate and candidate not in STATUS_WORDS:
-                title = candidate
-
-        if not title or not meta:
-            continue
-
-        notice_no, notice_date, status, competition_type = parse_meta(meta)
-        status = status or explicit_status
-        reception_started = "Y" if "접수중" in status or explicit_status == "접수중" else "N"
+        reception_started = "Y" if "접수중" in status else "N"
         link = find_link_for_title(html, title, page_url)
-
-        period = ""
-        contact = ""
-        if fetch_details and link.startswith("http") and link != page_url and "#onclick=" not in link:
-            try:
-                detail_html = fetch_html(link)
-                period, contact = parse_detail_fields(detail_html)
-            except Exception as exc:
-                print(f"[warn] detail fetch failed: {title}: {exc}", file=sys.stderr)
-
         key = make_key(notice_no, title, notice_date)
         records.append(
             Announcement(
@@ -232,8 +233,6 @@ def parse_announcements_from_html(html: str, page_url: str = BASE_URL, fetch_det
                 notice_no=notice_no,
                 title=title,
                 notice_date=notice_date,
-                reception_period=period,
-                contact=contact,
                 reception_started=reception_started,
                 link=link,
                 status=status,
@@ -252,6 +251,42 @@ def parse_announcements_from_html(html: str, page_url: str = BASE_URL, fetch_det
         deduped.append(record)
     return deduped
 
+
+def parse_announcements_from_html(html: str, page_url: str = BASE_URL, fetch_details: bool = False) -> list[Announcement]:
+    # First use robust text-pattern parsing. This is the path verified against the current IRIS page.
+    records = extract_announcements_by_regex(html, page_url)
+
+    # Optional detail fetch. The public list often does not expose stable hrefs; when it does, fill extras.
+    if fetch_details:
+        filled: list[Announcement] = []
+        for record in records:
+            period = ""
+            contact = ""
+            if record.link.startswith("http") and record.link != page_url and "#onclick=" not in record.link:
+                try:
+                    detail_html = fetch_html(record.link)
+                    period, contact = parse_detail_fields(detail_html)
+                except Exception as exc:
+                    print(f"[warn] detail fetch failed: {record.title}: {exc}", file=sys.stderr)
+            filled.append(
+                Announcement(
+                    ministry=record.ministry,
+                    agency=record.agency,
+                    notice_no=record.notice_no,
+                    title=record.title,
+                    notice_date=record.notice_date,
+                    reception_period=period,
+                    contact=contact,
+                    reception_started=record.reception_started,
+                    link=record.link,
+                    status=record.status,
+                    competition_type=record.competition_type,
+                    collected_at_utc=record.collected_at_utc,
+                    source_key=record.source_key,
+                )
+            )
+        return filled
+    return records
 
 def read_existing_keys(csv_path: Path) -> set[str]:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
