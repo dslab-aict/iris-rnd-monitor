@@ -1,67 +1,62 @@
-name: IRIS RND Announcement Scraper
+name: IRIS RND Scraper
 
 on:
-  schedule:
-    # GitHub Actions uses UTC. 15:00 UTC = 00:00 KST next day.
-    - cron: '0 15 * * *'
   workflow_dispatch:
+  schedule:
+    # 00:00 Asia/Seoul == 15:00 UTC previous day
+    - cron: "0 15 * * *"
 
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  PYTHONPATH: src
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          persist-credentials: true
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          pip install -r requirements.txt
 
-      - name: Run IRIS scraper
+      - name: Scrape IRIS
         env:
-          IRIS_OUTPUT_CSV: data/iris_announcements.csv
-          IRIS_MAX_PAGES: '7'
-          IRIS_HEADLESS: 'true'
-          IRIS_FAIL_ON_ZERO: 'true'
-        run: python -m iris_scraper
-
-      - name: Show CSV status
-        if: always()
+          PYTHONPATH: src
+          IRIS_MAX_PAGES: "1"
         run: |
-          echo "CSV status"
-          ls -la data || true
-          test -f data/iris_announcements.csv && wc -l data/iris_announcements.csv || true
-          test -f data/iris_announcements.csv && tail -n 5 data/iris_announcements.csv || true
-          echo "Git status"
-          git status --short
+          python -m iris_scraper --csv data/iris_announcements.csv --max-pages "$IRIS_MAX_PAGES"
+          echo "--- CSV preview ---"
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('data/iris_announcements.csv')
+          print('exists=', p.exists(), 'size=', p.stat().st_size if p.exists() else 0)
+          print('\n'.join(p.read_text(encoding='utf-8-sig').splitlines()[:5]))
+          PY
 
-      - name: Commit CSV if changed
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-debug-html
+          path: debug_iris_page*.html
+          if-no-files-found: ignore
+
+      - name: Commit CSV
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git status --short
           git add data/iris_announcements.csv
           if git diff --staged --quiet; then
-            echo "No CSV changes. This usually means all scraped announcements already exist in the CSV."
+            echo "No CSV changes to commit. This normally means all scraped records were duplicates."
           else
-            git commit -m "Update IRIS announcements $(TZ=Asia/Seoul date +'%Y-%m-%d')"
+            git commit -m "Update IRIS announcements"
             git push
           fi
