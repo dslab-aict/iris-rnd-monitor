@@ -27,9 +27,9 @@ IRIS 사업공고 페이지를 매일 확인하고, 신규 공고를 `data/iris_
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python -m playwright install chromium
-python -m src.iris_scraper
+PYTHONPATH=src python -m iris_scraper
 ```
 
 결과 CSV:
@@ -50,7 +50,7 @@ IRIS_HEADLESS=true
 
 1. GitHub에서 새 저장소를 만듭니다.
 2. 이 프로젝트의 모든 파일을 저장소 루트에 업로드합니다.
-3. 저장소의 `Actions` 탭에서 workflow를 활성화합니다.
+3. 저장소의 `Actions` 탭에서 workflow를 활성화합니다. GitHub의 Node.js 20 deprecation 경고를 피하기 위해 `actions/checkout@v5`, `actions/setup-python@v6`, `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`를 사용합니다.
 4. `Actions > IRIS RND Announcement Scraper > Run workflow`로 최초 1회 수동 실행합니다.
 
 자동 실행 시간은 `.github/workflows/iris.yml`에 정의되어 있습니다.

@@ -176,7 +176,14 @@ class IrisScraper:
             return self._scrape_with_playwright()
         except Exception as exc:  # pragma: no cover - runtime fallback
             print(f"[warn] Playwright scraping failed; falling back to static HTML: {exc}", file=sys.stderr)
-            return self._scrape_static_html()
+            try:
+                return self._scrape_static_html()
+            except Exception as fallback_exc:
+                # Do not fail the whole scheduled job because of a temporary
+                # network/DNS/site outage. main() will still create the CSV
+                # header if needed and GitHub Actions will finish successfully.
+                print(f"[error] Static HTML fallback also failed: {fallback_exc}", file=sys.stderr)
+                return []
 
     def _scrape_static_html(self) -> list[Announcement]:
         sess = requests.Session()
