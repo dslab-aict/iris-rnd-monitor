@@ -36,21 +36,23 @@ jobs:
           python -m pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Show environment
-        run: |
-          python --version
-          python -m pip --version
-          python - <<'PY'
-          import sys
-          print('sys.path=', sys.path)
-          PY
-
       - name: Run IRIS scraper
         env:
           IRIS_OUTPUT_CSV: data/iris_announcements.csv
-          IRIS_MAX_PAGES: '10'
+          IRIS_MAX_PAGES: '7'
           IRIS_HEADLESS: 'true'
+          IRIS_FAIL_ON_ZERO: 'true'
         run: python -m iris_scraper
+
+      - name: Show CSV status
+        if: always()
+        run: |
+          echo "CSV status"
+          ls -la data || true
+          test -f data/iris_announcements.csv && wc -l data/iris_announcements.csv || true
+          test -f data/iris_announcements.csv && tail -n 5 data/iris_announcements.csv || true
+          echo "Git status"
+          git status --short
 
       - name: Commit CSV if changed
         run: |
@@ -58,7 +60,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/iris_announcements.csv
           if git diff --staged --quiet; then
-            echo "No CSV changes."
+            echo "No CSV changes. This usually means all scraped announcements already exist in the CSV."
           else
             git commit -m "Update IRIS announcements $(TZ=Asia/Seoul date +'%Y-%m-%d')"
             git push
