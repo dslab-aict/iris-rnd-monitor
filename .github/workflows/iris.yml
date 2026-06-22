@@ -1,0 +1,82 @@
+name: IRIS RND Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Max pages to scrape. 0 = all pages"
+        required: false
+        default: "0"
+  schedule:
+    # 00:00 Asia/Seoul == 15:00 UTC previous day
+    - cron: "0 15 * * *"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pip install pytest
+          python -m pytest -q
+
+      - name: Scrape IRIS all pages and details
+        env:
+          PYTHONPATH: src
+          IRIS_MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
+        run: |
+          mkdir -p debug
+          python -m iris_scraper --csv data/iris_announcements.csv --max-pages "$IRIS_MAX_PAGES" --details --debug-dir debug
+          echo "--- CSV preview ---"
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('data/iris_announcements.csv')
+          print('exists=', p.exists(), 'size=', p.stat().st_size if p.exists() else 0)
+          rows = p.read_text(encoding='utf-8-sig').splitlines()
+          print('lines=', len(rows))
+          for line in rows[:8]:
+              print(line[:1000])
+          PY
+
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-debug-html
+          path: debug/*.html
+          if-no-files-found: ignore
+
+      - name: Commit CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git status --short
+          git add data/iris_announcements.csv
+          if git diff --staged --quiet; then
+            echo "No CSV changes to commit. Usually all scraped records are already present."
+          else
+            git commit -m "Update IRIS announcements"
+            git push
+          fi
