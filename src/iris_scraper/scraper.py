@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -28,11 +30,10 @@ CSV_FIELDS = [
     "바로 가기 링크",
     "공고상태",
     "공모유형",
+    "상세본문요약",
     "수집일시_UTC",
     "source_key",
 ]
-
-STATUS_WORDS = {"접수중", "접수예정", "마감"}
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class Announcement:
     link: str = BASE_URL
     status: str = ""
     competition_type: str = ""
+    detail_summary: str = ""
     collected_at_utc: str = ""
     source_key: str = ""
 
@@ -64,12 +66,14 @@ class Announcement:
             "바로 가기 링크": self.link,
             "공고상태": self.status,
             "공모유형": self.competition_type,
+            "상세본문요약": self.detail_summary,
             "수집일시_UTC": self.collected_at_utc,
             "source_key": self.source_key,
         }
 
 
 def clean_text(value: str) -> str:
+    value = value or ""
     value = value.replace("\u00a0", " ")
     value = value.replace("？", "-").replace("–", "-").replace("—", "-")
     value = re.sub(r"\s+", " ", value)
@@ -87,122 +91,40 @@ def build_page_url(page: int) -> str:
     return BASE_URL + "?" + urlencode({"pageIndex": page})
 
 
-def fetch_html(url: str, timeout: int = 30) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "Chrome/126.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.iris.go.kr/",
-    }
-    response = requests.get(url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding or response.encoding
-    return response.text
-
-
 def html_to_lines(html: str) -> list[str]:
-    # Use Python's built-in parser. Do not require lxml on GitHub runners.
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
     lines = [clean_text(x) for x in soup.get_text("\n").splitlines()]
     return [x for x in lines if x]
 
 
-def find_link_for_title(html: str, title: str, base_url: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    title_norm = clean_text(title)
-    for tag in soup.find_all(["a", "button"]):
-        text = clean_text(tag.get_text(" "))
-        if not text or title_norm not in text:
-            continue
-        href = tag.get("href")
-        onclick = tag.get("onclick") or ""
-        if href and href != "#":
-            return urljoin(base_url, href)
-        # Preserve JavaScript navigation if that is all IRIS exposes.
-        if onclick:
-            return base_url + "#onclick=" + re.sub(r"\s+", " ", onclick.strip())
-    return base_url
-
-
-def parse_meta(meta: str) -> tuple[str, str, str, str]:
-    notice_no = ""
-    notice_date = ""
-    status = ""
-    competition_type = ""
-
-    m = re.search(r"공고번호\s*:\s*(.*?)\s*공고일자\s*:", meta)
+def extract_total_pages(html: str) -> int:
+    text = "\n".join(html_to_lines(html))
+    m = re.search(r"현재\s*페이지\s*\d+\s*/\s*(\d+)", text)
     if m:
-        notice_no = clean_text(m.group(1))
-    m = re.search(r"공고일자\s*:\s*(\d{4}-\d{2}-\d{2})", meta)
+        return max(1, int(m.group(1)))
+    m = re.search(r"전체\s*[\d,]+\s*건.*?현재\s*페이지\s*\d+\s*/\s*(\d+)", text)
     if m:
-        notice_date = clean_text(m.group(1))
-    m = re.search(r"공고상태\s*:\s*(.*?)\s*공모유형\s*:", meta)
-    if m:
-        status = clean_text(m.group(1))
-    m = re.search(r"공모유형\s*:\s*(.*)$", meta)
-    if m:
-        competition_type = clean_text(m.group(1))
-    return notice_no, notice_date, status, competition_type
+        return max(1, int(m.group(1)))
+    return 1
 
 
-def parse_detail_fields(html: str) -> tuple[str, str]:
-    lines = html_to_lines(html)
-    joined = "\n".join(lines)
-
-    period = ""
-    contact = ""
-
-    patterns_period = [
-        r"접수기간\s*[:：]?\s*([^\n]+)",
-        r"연구개발계획서\s*접수기간\s*[:：]?\s*([^\n]+)",
-        r"신청기간\s*[:：]?\s*([^\n]+)",
-    ]
-    for pat in patterns_period:
-        m = re.search(pat, joined)
-        if m:
-            period = clean_text(m.group(1))
-            break
-
-    # Korean phone numbers, optionally combined with 담당자 nearby.
-    phone = re.search(r"(?:\d{2,4}-\d{3,4}-\d{4}|\d{4}-\d{4})", joined)
-    if phone:
-        contact = phone.group(0)
-
-    return period, contact
-
-
-
-def extract_announcements_by_regex(html: str, page_url: str = BASE_URL) -> list[Announcement]:
-    """Parse the IRIS public list from text, without relying on fragile CSS selectors.
-
-    IRIS currently renders list records in this textual sequence:
-    소관부처 > 전문기관 / 공고명 / 공고번호 : ... 공고일자 : ... 공고상태 : ... 공모유형 : ...
-    The exact DOM classes are not stable, so this function treats the page as text.
-    """
+def parse_list_records(html: str, page_url: str = BASE_URL) -> list[Announcement]:
     lines = html_to_lines(html)
     text = "\n".join(lines)
     collected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     records: list[Announcement] = []
 
-    # Main pattern: each record begins with a ministry/agency line and ends at 공모유형.
     pattern = re.compile(
-        r"(?P<ministry>[^\n<>]{2,60}?)\s*>\s*(?P<agency>[^\n<>]{2,90}?)\n+"
+        r"(?P<ministry>[^\n<>]{2,60}?)\s*>\s*(?P<agency>[^\n<>]{2,100}?)\n+"
         r"(?P<title>(?:(?!\n\s*공고번호\s*:).)+?)\n+"
         r"공고번호\s*:\s*(?P<notice_no>.*?)\s*공고일자\s*:\s*"
         r"(?P<notice_date>\d{4}-\d{2}-\d{2})\s*공고상태\s*:\s*"
         r"(?P<status>.*?)\s*공모유형\s*:\s*(?P<competition_type>[^\n]+)",
         re.DOTALL,
     )
-
-    bad_prefixes = (
-        "관련부처", "전문기관 홈페이지", "IRIS", "Home", "사업정보", "R&D정보",
-        "소관부처 전체선택", "전문기관 전체선택",
-    )
+    bad_prefixes = ("관련부처", "전문기관 홈페이지", "IRIS", "Home", "사업정보", "R&D정보", "소관부처 전체선택", "전문기관 전체선택")
 
     for m in pattern.finditer(text):
         ministry = clean_text(m.group("ministry"))
@@ -212,20 +134,14 @@ def extract_announcements_by_regex(html: str, page_url: str = BASE_URL) -> list[
         notice_date = clean_text(m.group("notice_date"))
         status = clean_text(m.group("status"))
         competition_type = clean_text(m.group("competition_type"))
-
         if any(ministry.startswith(x) for x in bad_prefixes):
             continue
         if "전체선택" in ministry or "전체선택" in agency:
             continue
         if not notice_no or not title or not notice_date:
             continue
-        # Avoid footer link blocks and navigation noise.
-        if len(ministry) > 60 or len(agency) > 90 or len(title) > 260:
+        if len(title) > 350:
             continue
-
-        reception_started = "Y" if "접수중" in status else "N"
-        link = find_link_for_title(html, title, page_url)
-        key = make_key(notice_no, title, notice_date)
         records.append(
             Announcement(
                 ministry=ministry,
@@ -233,12 +149,12 @@ def extract_announcements_by_regex(html: str, page_url: str = BASE_URL) -> list[
                 notice_no=notice_no,
                 title=title,
                 notice_date=notice_date,
-                reception_started=reception_started,
-                link=link,
+                reception_started="Y" if "접수중" in status else "N",
+                link=page_url,
                 status=status,
                 competition_type=competition_type,
                 collected_at_utc=collected_at,
-                source_key=key,
+                source_key=make_key(notice_no, title, notice_date),
             )
         )
 
@@ -252,41 +168,57 @@ def extract_announcements_by_regex(html: str, page_url: str = BASE_URL) -> list[
     return deduped
 
 
-def parse_announcements_from_html(html: str, page_url: str = BASE_URL, fetch_details: bool = False) -> list[Announcement]:
-    # First use robust text-pattern parsing. This is the path verified against the current IRIS page.
-    records = extract_announcements_by_regex(html, page_url)
+def first_match(patterns: list[str], text: str) -> str:
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I | re.M)
+        if m:
+            return clean_text(m.group(1))
+    return ""
 
-    # Optional detail fetch. The public list often does not expose stable hrefs; when it does, fill extras.
-    if fetch_details:
-        filled: list[Announcement] = []
-        for record in records:
-            period = ""
-            contact = ""
-            if record.link.startswith("http") and record.link != page_url and "#onclick=" not in record.link:
-                try:
-                    detail_html = fetch_html(record.link)
-                    period, contact = parse_detail_fields(detail_html)
-                except Exception as exc:
-                    print(f"[warn] detail fetch failed: {record.title}: {exc}", file=sys.stderr)
-            filled.append(
-                Announcement(
-                    ministry=record.ministry,
-                    agency=record.agency,
-                    notice_no=record.notice_no,
-                    title=record.title,
-                    notice_date=record.notice_date,
-                    reception_period=period,
-                    contact=contact,
-                    reception_started=record.reception_started,
-                    link=record.link,
-                    status=record.status,
-                    competition_type=record.competition_type,
-                    collected_at_utc=record.collected_at_utc,
-                    source_key=record.source_key,
-                )
-            )
-        return filled
-    return records
+
+def parse_detail_fields(html: str) -> dict[str, str]:
+    lines = html_to_lines(html)
+    text = "\n".join(lines)
+    joined = clean_text(" ".join(lines))
+
+    period = first_match([
+        r"접수\s*기간\s*[:：]?\s*([^\n]{6,120})",
+        r"신청\s*기간\s*[:：]?\s*([^\n]{6,120})",
+        r"연구개발계획서\s*접수기간\s*[:：]?\s*([^\n]{6,120})",
+        r"공고\s*및\s*접수기간\s*[:：]?\s*([^\n]{6,120})",
+    ], text)
+    if not period:
+        m = re.search(r"(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}[^\n]{0,80}?(?:까지|마감|18:00|17:00))", text)
+        if m:
+            period = clean_text(m.group(1))
+
+    phones = sorted(set(re.findall(r"(?:0\d{1,2}-\d{3,4}-\d{4}|\d{4}-\d{4})", joined)))
+    emails = sorted(set(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", joined)))
+    contact = "; ".join(phones + emails)
+
+    # Keep a compact searchable detail text, excluding global menus as much as possible.
+    useful = []
+    keywords = ("접수", "신청", "담당", "문의", "연락", "공고", "기간", "주관", "전문기관")
+    for line in lines:
+        if any(k in line for k in keywords):
+            if len(line) <= 220 and line not in useful:
+                useful.append(line)
+    summary = " | ".join(useful[:12])
+    return {"period": period, "contact": contact, "summary": summary}
+
+
+def fetch_html(url: str, timeout: int = 30) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.iris.go.kr/",
+    }
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding
+    return response.text
+
 
 def read_existing_keys(csv_path: Path) -> set[str]:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
@@ -295,9 +227,7 @@ def read_existing_keys(csv_path: Path) -> set[str]:
         reader = csv.DictReader(f)
         keys: set[str] = set()
         for row in reader:
-            key = row.get("source_key") or make_key(
-                row.get("공고번호", ""), row.get("공고명", ""), row.get("공고일자", "")
-            )
+            key = row.get("source_key") or make_key(row.get("공고번호", ""), row.get("공고명", ""), row.get("공고일자", ""))
             if key:
                 keys.add(key)
         return keys
@@ -308,10 +238,10 @@ def append_csv(csv_path: Path, records: Iterable[Announcement]) -> int:
     existing = read_existing_keys(csv_path)
     new_rows: list[dict[str, str]] = []
     for record in records:
-        if record.source_key not in existing:
-            new_rows.append(record.to_row())
-            existing.add(record.source_key)
-
+        if record.source_key in existing:
+            continue
+        new_rows.append(record.to_row())
+        existing.add(record.source_key)
     file_exists = csv_path.exists() and csv_path.stat().st_size > 0
     with csv_path.open("a", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -321,37 +251,180 @@ def append_csv(csv_path: Path, records: Iterable[Announcement]) -> int:
     return len(new_rows)
 
 
-def scrape(max_pages: int, fetch_details: bool, debug_dir: Path) -> list[Announcement]:
-    all_records: list[Announcement] = []
-    for page in range(1, max_pages + 1):
-        url = build_page_url(page)
+def merge_records(base: Announcement, detail_html: str, link: str) -> Announcement:
+    fields = parse_detail_fields(detail_html)
+    return replace(
+        base,
+        reception_period=fields["period"],
+        contact=fields["contact"],
+        detail_summary=fields["summary"],
+        link=link or base.link,
+    )
+
+
+def scrape_static_all(max_pages: int, debug_dir: Path) -> tuple[list[Announcement], int]:
+    first_html = fetch_html(BASE_URL)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / "debug_iris_static_page1.html").write_text(first_html, encoding="utf-8")
+    total_pages = extract_total_pages(first_html)
+    if max_pages and max_pages > 0:
+        total_pages = min(total_pages, max_pages)
+    records = parse_list_records(first_html, BASE_URL)
+    print(f"[info] static page=1 parsed={len(records)} total_pages={total_pages}")
+    for page_no in range(2, total_pages + 1):
+        url = build_page_url(page_no)
         html = fetch_html(url)
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        (debug_dir / f"debug_iris_page{page}.html").write_text(html, encoding="utf-8")
-        records = parse_announcements_from_html(html, url, fetch_details=fetch_details)
-        print(f"[info] page={page} parsed={len(records)} url={url}")
-        all_records.extend(records)
-    # global dedupe
+        (debug_dir / f"debug_iris_static_page{page_no}.html").write_text(html, encoding="utf-8")
+        page_records = parse_list_records(html, url)
+        print(f"[info] static page={page_no} parsed={len(page_records)} url={url}")
+        records.extend(page_records)
+    return dedupe(records), total_pages
+
+
+def dedupe(records: Iterable[Announcement]) -> list[Announcement]:
+    out: list[Announcement] = []
     seen: set[str] = set()
-    deduped: list[Announcement] = []
-    for record in all_records:
+    for record in records:
         if record.source_key in seen:
             continue
         seen.add(record.source_key)
-        deduped.append(record)
-    return deduped
+        out.append(record)
+    return out
+
+
+def click_title_js() -> str:
+    return r'''
+    (title) => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const target = norm(title);
+      const nodes = Array.from(document.querySelectorAll('a, button, [onclick], li, div, span, p'));
+      let best = null;
+      for (const node of nodes) {
+        const text = norm(node.innerText || node.textContent || '');
+        if (!text || !text.includes(target)) continue;
+        if (!best || text.length < norm(best.innerText || best.textContent || '').length) best = node;
+      }
+      if (!best) return {clicked:false, reason:'title_not_found'};
+      const clickable = best.closest('a, button, [onclick], li[onclick], div[onclick]') || best;
+      clickable.scrollIntoView({block:'center', inline:'center'});
+      clickable.click();
+      return {clicked:true, tag: clickable.tagName, text: norm(clickable.innerText || clickable.textContent || '').slice(0, 200)};
+    }
+    '''
+
+
+def click_page_js() -> str:
+    return r'''
+    (pageNo) => {
+      const want = String(pageNo);
+      const candidates = Array.from(document.querySelectorAll('a, button, [onclick], span'));
+      for (const el of candidates) {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, '').trim();
+        const label = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+        if (text === want || label === want || label.includes(want + '페이지')) {
+          const clickable = el.closest('a, button, [onclick]') || el;
+          clickable.scrollIntoView({block:'center', inline:'center'});
+          clickable.click();
+          return {clicked:true, text, label};
+        }
+      }
+      return {clicked:false, reason:'page_button_not_found'};
+    }
+    '''
+
+
+def scrape_playwright_full(max_pages: int, debug_dir: Path, headless: bool = True) -> list[Announcement]:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    detailed: list[Announcement] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+        )
+        page = context.new_page()
+        page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+        first_html = page.content()
+        total_pages = extract_total_pages(first_html)
+        if max_pages and max_pages > 0:
+            total_pages = min(total_pages, max_pages)
+        print(f"[info] playwright total_pages={total_pages}")
+
+        for page_no in range(1, total_pages + 1):
+            if page_no > 1:
+                target_url = build_page_url(page_no)
+                page.goto(target_url, wait_until="networkidle", timeout=60000)
+                html_after_url = page.content()
+                recs_after_url = parse_list_records(html_after_url, page.url)
+                # If pageIndex URL did not move the list, try clicking the numbered paginator.
+                if not recs_after_url or (page_no > 1 and "현재 페이지 1/" in "\n".join(html_to_lines(html_after_url))):
+                    page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+                    result = page.evaluate(click_page_js(), page_no)
+                    print(f"[info] pagination click page={page_no} result={json.dumps(result, ensure_ascii=False)}")
+                    page.wait_for_load_state("networkidle", timeout=15000)
+
+            list_html = page.content()
+            (debug_dir / f"debug_iris_list_page{page_no}.html").write_text(list_html, encoding="utf-8")
+            list_records = parse_list_records(list_html, page.url)
+            print(f"[info] list page={page_no} records={len(list_records)} url={page.url}")
+
+            for idx, record in enumerate(list_records, start=1):
+                # Reopen list page before every click, because detail pages can mutate history/state.
+                if page_no == 1:
+                    page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+                else:
+                    page.goto(build_page_url(page_no), wait_until="networkidle", timeout=60000)
+                    page_html_check = page.content()
+                    if not parse_list_records(page_html_check, page.url):
+                        page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+                        page.evaluate(click_page_js(), page_no)
+                        page.wait_for_load_state("networkidle", timeout=15000)
+
+                before_url = page.url
+                click_result = page.evaluate(click_title_js(), record.title)
+                print(f"[info] detail click page={page_no} item={idx} clicked={click_result.get('clicked')} title={record.title[:60]}")
+                if not click_result.get("clicked"):
+                    detailed.append(record)
+                    continue
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except PlaywrightTimeoutError:
+                    pass
+                time.sleep(0.6)
+                detail_html = page.content()
+                detail_url = page.url
+                # If content did not change meaningfully, still save debug and keep list fields.
+                (debug_dir / f"debug_iris_detail_p{page_no}_i{idx}.html").write_text(detail_html, encoding="utf-8")
+                if detail_url == before_url and record.title in "\n".join(html_to_lines(detail_html)) and len(parse_list_records(detail_html, detail_url)) >= len(list_records):
+                    detailed.append(record)
+                else:
+                    detailed.append(merge_records(record, detail_html, detail_url))
+
+        context.close()
+        browser.close()
+    return dedupe(detailed)
+
+
+def scrape(max_pages: int, details: bool, debug_dir: Path) -> list[Announcement]:
+    if details:
+        return scrape_playwright_full(max_pages=max_pages, debug_dir=debug_dir)
+    records, _ = scrape_static_all(max_pages=max_pages, debug_dir=debug_dir)
+    return records
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scrape IRIS R&D announcements into CSV.")
     parser.add_argument("--csv", default="data/iris_announcements.csv", help="CSV output path")
-    parser.add_argument("--max-pages", type=int, default=1, help="Number of list pages to fetch")
-    parser.add_argument("--debug-dir", default=".", help="Directory for debug_iris_page*.html")
-    parser.add_argument("--fetch-details", action="store_true", help="Try to fetch detail pages when hrefs are exposed")
+    parser.add_argument("--max-pages", type=int, default=0, help="0 means auto-detect all pages")
+    parser.add_argument("--debug-dir", default=".", help="Directory for debug HTML files")
+    parser.add_argument("--details", action="store_true", help="Visit every list page and click every announcement detail")
     args = parser.parse_args(argv)
 
     try:
-        records = scrape(args.max_pages, args.fetch_details, Path(args.debug_dir))
+        records = scrape(args.max_pages, args.details, Path(args.debug_dir))
     except Exception as exc:
         print(f"[fatal] scrape failed: {exc}", file=sys.stderr)
         return 1
@@ -359,13 +432,13 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = Path(args.csv)
     appended = append_csv(csv_path, records)
     size = csv_path.stat().st_size if csv_path.exists() else 0
-    print(f"[result] scraped={len(records)} appended={appended} csv={csv_path} csv_size={size}")
+    with_detail = sum(1 for r in records if r.reception_period or r.contact or r.detail_summary)
+    print(f"[result] scraped={len(records)} with_detail={with_detail} appended={appended} csv={csv_path} csv_size={size}")
 
     if len(records) == 0:
-        print("[fatal] 0 records scraped. Open uploaded debug_iris_page1.html artifact.", file=sys.stderr)
+        print("[fatal] 0 records scraped. Open uploaded iris-debug-html artifact.", file=sys.stderr)
         return 2
+    if args.details and with_detail == 0:
+        print("[fatal] detail mode ran, but no detail fields were captured. Open debug detail HTML artifacts.", file=sys.stderr)
+        return 3
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
