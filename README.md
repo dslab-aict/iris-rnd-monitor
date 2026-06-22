@@ -1,8 +1,17 @@
-# IRIS 국가연구개발 사업공고 CSV 스크래퍼
+# IRIS R&D Announcement CSV Scraper
 
-IRIS 사업공고 페이지를 매일 00:00 KST에 수집해 `data/iris_announcements.csv`에 append합니다.
+IRIS 사업공고 목록을 읽어 CSV에 누적 저장하는 GitHub Actions 프로젝트입니다.
 
-## 수집 필드
+## 포함 기능
+
+- IRIS 사업공고 목록 수집
+- CSV append
+- `공고번호 + 공고명 + 공고일자` 기반 중복 방지
+- 매일 00:00 KST 자동 실행
+- 수동 실행 지원
+- 0건 수집 시 실패 처리 및 debug HTML artifact 업로드
+
+## CSV 컬럼
 
 - 소관부처
 - 전문기관
@@ -15,35 +24,43 @@ IRIS 사업공고 페이지를 매일 00:00 KST에 수집해 `data/iris_announce
 - 바로 가기 링크
 - 공고상태
 - 공모유형
+- 수집일시_UTC
+- source_key
 
-현재 IRIS 목록 HTML에서 안정적으로 노출되는 값은 소관부처, 전문기관, 공고번호, 공고명, 공고일자, 공고상태, 공모유형입니다. 상세 페이지 고유 URL, 접수기간, 담당자 연락처는 목록 정적 HTML에 없으면 공란으로 저장합니다.
-
-## 로컬 실행
+## 설치 및 로컬 실행
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 PYTHONPATH=src python -m iris_scraper --csv data/iris_announcements.csv --max-pages 1
 ```
 
 ## GitHub Actions 실행
 
-1. 이 프로젝트 전체를 GitHub repository에 업로드합니다.
-2. `Actions` 탭에서 `IRIS RND Scraper`를 선택합니다.
-3. `Run workflow`를 누릅니다.
-4. 실행 로그에서 다음을 확인합니다.
+1. 이 프로젝트 파일 전체를 GitHub 저장소에 업로드합니다.
+2. 저장소의 `Actions` 탭으로 이동합니다.
+3. `IRIS RND Scraper` workflow를 선택합니다.
+4. `Run workflow`를 누릅니다.
 
-```text
-[info] page 1: parsed ... records
-[result] scraped=... appended=...
---- CSV preview ---
+자동 실행은 `.github/workflows/iris.yml`의 다음 cron으로 설정되어 있습니다.
+
+```yaml
+- cron: "0 15 * * *"
 ```
 
-## 중복 방지
+GitHub Actions cron은 UTC 기준이므로 `15:00 UTC`가 한국시간 `00:00 KST`입니다.
 
-`공고번호 + 공고명 + 공고일자`를 SHA-256 해시로 만든 `source_key` 기준으로 중복 저장을 방지합니다.
+## 이번 수정의 핵심
 
-## 페이지 수집 범위
+`BeautifulSoup(html, "lxml")`를 사용하지 않습니다. GitHub runner에 별도 native parser 설치가 없어도 동작하도록 Python 기본 HTML parser를 사용합니다.
 
-기본값은 1페이지입니다. Actions YAML의 `IRIS_MAX_PAGES` 값을 늘릴 수 있습니다. 다만 IRIS의 페이지 파라미터는 사이트 변경 가능성이 있어 2페이지 이후는 환경에 따라 동작하지 않을 수 있습니다.
+```python
+BeautifulSoup(html, "html.parser")
+```
+
+따라서 `requirements.txt`에는 `lxml`이 없습니다.
+
+## 주의
+
+IRIS 상세 페이지 링크가 서버 HTML에 직접 노출되지 않는 경우, `접수기간`, `사업담당자 연락처`, 상세 `바로 가기 링크`는 비어 있거나 목록 페이지 URL로 저장될 수 있습니다. 목록에서 확인 가능한 필드인 소관부처, 전문기관, 공고번호, 공고명, 공고일자, 접수상태, 공모유형은 파싱합니다.

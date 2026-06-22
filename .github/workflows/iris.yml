@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -24,7 +27,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pip install pytest
+          python -m pytest -q
 
       - name: Scrape IRIS
         env:
@@ -37,7 +47,8 @@ jobs:
           from pathlib import Path
           p = Path('data/iris_announcements.csv')
           print('exists=', p.exists(), 'size=', p.stat().st_size if p.exists() else 0)
-          print('\n'.join(p.read_text(encoding='utf-8-sig').splitlines()[:5]))
+          for line in p.read_text(encoding='utf-8-sig').splitlines()[:8]:
+              print(line)
           PY
 
       - name: Upload debug HTML
@@ -55,7 +66,7 @@ jobs:
           git status --short
           git add data/iris_announcements.csv
           if git diff --staged --quiet; then
-            echo "No CSV changes to commit. This normally means all scraped records were duplicates."
+            echo "No CSV changes to commit. Usually all scraped records are already present."
           else
             git commit -m "Update IRIS announcements"
             git push
